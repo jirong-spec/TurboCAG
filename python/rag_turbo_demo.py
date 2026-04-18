@@ -61,6 +61,13 @@ try:
 except ImportError:
     _KAGGLE_OK = False
 
+# Optional dense retrieval + cross-encoder re-ranking
+try:
+    from sentence_transformers import SentenceTransformer, CrossEncoder
+    _ST_OK = True
+except ImportError:
+    _ST_OK = False
+
 try:
     import pandas as pd
 except ImportError:
@@ -317,6 +324,132 @@ class BM25:
 
 
 # ─────────────────────────────────────────────────────────────────── #
+# Dense retriever: embeddings in VRAM, cosine similarity              #
+# ─────────────────────────────────────────────────────────────────── #
+
+class DenseRetriever:
+    """Encode corpus with sentence-transformers; store float16 embeddings in VRAM.
+
+    Memory: N_docs × D × 2 bytes.  all-MiniLM-L6-v2 (D=384):
+      200k docs → 154 MB VRAM.
+    Query latency: single GPU matmul, sub-millisecond.
+    """
+
+    def __init__(
+        self,
+        docs: list[str],
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        device: str = DEVICE,
+        batch_size: int = 512,
+    ) -> None:
+        if not _ST_OK:
+            raise ImportError("pip install sentence-transformers")
+        self.docs   = docs
+        self.device = device
+
+        print(f"Dense     : loading {model_name} …")
+        self._model = SentenceTransformer(model_name, device=device)
+
+        print(f"Dense     : encoding {len(docs):,} docs (batch={batch_size}) …")
+        emb = self._model.encode(
+            docs,
+            batch_size=batch_size,
+            show_progress_bar=True,
+            convert_to_tensor=True,
+            device=device,
+            normalize_embeddings=True,   # L2-norm → cosine sim = dot product
+        )
+        self.embeddings = emb.half()     # [N, D] float16 in VRAM
+        vram_mb = self.embeddings.numel() * 2 / 1024 ** 2
+        print(f"Dense     : dim={emb.shape[1]}, {vram_mb:.0f} MB VRAM")
+
+    def retrieve(self, query: str, k: int = 5) -> list[tuple[int, float, str]]:
+        q = self._model.encode(
+            [query], convert_to_tensor=True, device=self.device,
+            normalize_embeddings=True,
+        ).half()                                       # [1, D]
+        scores = (self.embeddings @ q.T).squeeze(1)   # [N]
+        k      = min(k, len(self.docs))
+        topk   = torch.topk(scores, k)
+        return [
+            (idx.item(), topk.values[i].item(), self.docs[idx.item()])
+            for i, idx in enumerate(topk.indices)
+        ]
+
+
+# ─────────────────────────────────────────────────────────────────── #
+# Hybrid retriever: RRF(BM25, Dense)                                  #
+# ─────────────────────────────────────────────────────────────────── #
+
+class HybridRetriever:
+    """Reciprocal Rank Fusion of BM25 and dense results.
+
+    RRF score = Σ 1/(rrf_k + rank_i),  rrf_k=60 (standard default).
+    Fetches k*3 candidates from each arm before fusion so tail docs
+    still get a chance to surface in the merged top-k.
+    """
+
+    def __init__(self, bm25: BM25, dense: DenseRetriever, rrf_k: int = 60) -> None:
+        self.bm25   = bm25
+        self.dense  = dense
+        self.rrf_k  = rrf_k
+
+    @property
+    def docs(self) -> list[str]:
+        return self.bm25.docs
+
+    def retrieve(self, query: str, k: int = 5) -> list[tuple[int, float, str]]:
+        fetch = k * 3
+        bm25_hits  = self.bm25.retrieve(query,  k=fetch)
+        dense_hits = self.dense.retrieve(query, k=fetch)
+
+        rrf: dict[int, float] = {}
+        for rank, (doc_idx, _, _) in enumerate(bm25_hits):
+            rrf[doc_idx] = rrf.get(doc_idx, 0.0) + 1.0 / (self.rrf_k + rank + 1)
+        for rank, (doc_idx, _, _) in enumerate(dense_hits):
+            rrf[doc_idx] = rrf.get(doc_idx, 0.0) + 1.0 / (self.rrf_k + rank + 1)
+
+        top = sorted(rrf.items(), key=lambda x: x[1], reverse=True)[:k]
+        return [(doc_idx, score, self.bm25.docs[doc_idx]) for doc_idx, score in top]
+
+
+# ─────────────────────────────────────────────────────────────────── #
+# Cross-encoder re-ranker                                             #
+# ─────────────────────────────────────────────────────────────────── #
+
+class CrossEncoderReranker:
+    """Score (query, doc) pairs with a cross-encoder; return top-k by score.
+
+    Model default: cross-encoder/ms-marco-MiniLM-L-6-v2 (~65 MB).
+    Runs on GPU; typical latency for 20 pairs < 20 ms.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        device: str = DEVICE,
+    ) -> None:
+        if not _ST_OK:
+            raise ImportError("pip install sentence-transformers")
+        print(f"Reranker  : loading {model_name} …")
+        self._model = CrossEncoder(model_name, device=device)
+        print(f"Reranker  : ready")
+
+    def rerank(
+        self,
+        query: str,
+        hits: list[tuple[int, float, str]],
+        k: int = 5,
+    ) -> list[tuple[int, float, str]]:
+        if not hits:
+            return hits
+        pairs  = [(query, doc) for _, _, doc in hits]
+        scores = self._model.predict(pairs, batch_size=32)  # batch to avoid OOM
+        ranked = sorted(zip(scores.tolist(), hits), key=lambda x: x[0], reverse=True)
+        return [hit for _, hit in ranked[:k]]
+
+
+# ─────────────────────────────────────────────────────────────────── #
 # Ollama                                                               #
 # ─────────────────────────────────────────────────────────────────── #
 
@@ -329,19 +462,35 @@ def ollama_available(url: str, model: str) -> bool:
         return False
 
 
-def ollama_generate(prompt: str, url: str, model: str, timeout: int) -> tuple[str, float]:
+def ollama_generate(
+    prompt: str, url: str, model: str, timeout: int
+) -> tuple[str, float, float]:
+    """Returns (text, total_ms, ttft_ms). Uses streaming to capture TTFT."""
+    t0 = time.perf_counter()
+    ttft_ms: float | None = None
+    parts: list[str] = []
     try:
-        t0 = time.perf_counter()
-        r  = requests.post(
+        with requests.post(
             f"{url}/api/generate",
-            json={"model": model, "prompt": prompt, "stream": False},
+            json={"model": model, "prompt": prompt, "stream": True},
             timeout=timeout,
-        )
-        r.raise_for_status()
-        ms = (time.perf_counter() - t0) * 1000
-        return r.json().get("response", "").strip(), ms
+            stream=True,
+        ) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                data = json.loads(line)
+                tok = data.get("response", "")
+                if tok and ttft_ms is None:
+                    ttft_ms = (time.perf_counter() - t0) * 1000
+                parts.append(tok)
+                if data.get("done"):
+                    break
+        total_ms = (time.perf_counter() - t0) * 1000
+        return "".join(parts).strip(), total_ms, ttft_ms or 0.0
     except Exception as exc:
-        return f"[unavailable: {exc}]", 0.0
+        return f"[unavailable: {exc}]", 0.0, 0.0
 
 
 def build_prompt(system: str, question: str, context: str) -> str:
@@ -414,24 +563,36 @@ def _avg(lst: list[KVResult], attr: str) -> float:
 def write_report(
     cfg: dict,
     qa_pairs: list[dict],
-    retrieval_hits: int,
+    bm25_hits: int,
+    hybrid_hits: int | None,
+    reranked_hits: int | None,
     llm_rows: list[dict],
     kv_all: list[KVResult],
 ) -> None:
     out_dir   = ROOT / _cfg(cfg, "output", "dir",         default="output")
     stem      = _cfg(cfg, "output", "report_stem", default="rag_results")
     top_k     = _cfg(cfg, "retrieval", "top_k",    default=5)
+    fetch_k   = _cfg(cfg, "retrieval", "fetch_k",  default=top_k)
     model     = _cfg(cfg, "llm", "model",          default="")
     handle    = _cfg(cfg, "dataset", "kaggle_handle", default="local")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    total     = len(qa_pairs)
-    recall    = retrieval_hits / total if total else 0
-    llm_acc   = (sum(1 for r in llm_rows if r["correct"]) / len(llm_rows)
-                 if llm_rows else None)
+    total          = len(qa_pairs)
+    bm25_recall    = bm25_hits    / total if total else 0
+    hybrid_recall  = hybrid_hits  / total if (hybrid_hits  is not None and total) else None
+    reranked_recall= reranked_hits / total if (reranked_hits is not None and total) else None
+    llm_acc        = (sum(1 for r in llm_rows if r["correct"]) / len(llm_rows)
+                      if llm_rows else None)
 
     prod_lst  = [r for r in kv_all if r.scheme == "turbo_prod"]
     mse_lst   = [r for r in kv_all if r.scheme == "turbo_mse"]
+
+    if reranked_hits is not None:
+        retrieval_mode = f"Hybrid@{fetch_k} + CrossEncoder → top-{top_k}"
+    elif hybrid_hits is not None:
+        retrieval_mode = f"Hybrid (BM25 + Dense, RRF), top-{top_k}"
+    else:
+        retrieval_mode = f"BM25, top-{top_k}"
 
     lines = [
         "# TurboRAG — RAG Benchmark Report\n",
@@ -439,39 +600,48 @@ def write_report(
         f"- Corpus size  : {total} documents",
         f"- Questions    : {total}",
         f"- LLM model    : {model}",
-        f"- BM25 top-k   : {top_k}",
+        f"- Retrieval    : {retrieval_mode}",
         "",
         "---",
         "",
-        "## Retrieval Recall (BM25)\n",
-        f"| Metric | Value |",
-        f"|--------|-------|",
-        f"| Total questions | {total} |",
-        f"| Answer found in top-{top_k} chunks | {retrieval_hits} |",
-        f"| **Retrieval recall** | **{recall:.1%}** |",
-        "",
-        "---",
-        "",
+        "## Retrieval Recall\n",
+        f"| Retriever | k | Hits | Recall |",
+        f"|-----------|---|------|--------|",
+        f"| BM25 only | {top_k} | {bm25_hits} | {bm25_recall:.1%} |",
     ]
+    if hybrid_recall is not None:
+        delta = hybrid_recall - bm25_recall
+        lines.append(
+            f"| Hybrid (RRF) | {fetch_k} | {hybrid_hits} | {hybrid_recall:.1%} "
+            f"(+{delta:.1%}) |"
+        )
+    if reranked_recall is not None:
+        delta2 = reranked_recall - bm25_recall
+        lines.append(
+            f"| **Hybrid + Rerank** | **{top_k}** | **{reranked_hits}** | **{reranked_recall:.1%}** "
+            f"(+{delta2:.1%} vs BM25) |"
+        )
+    lines += ["", "---", ""]
 
     if llm_rows:
         correct_n = sum(1 for r in llm_rows if r["correct"])
-        avg_lat   = sum(r["lat_ms"] for r in llm_rows) / len(llm_rows)
+        avg_lat   = sum(r["lat_ms"]  for r in llm_rows) / len(llm_rows)
+        avg_ttft  = sum(r.get("ttft_ms", 0) for r in llm_rows) / len(llm_rows)
         lines += [
             f"## LLM Accuracy ({model}, {len(llm_rows)}-question sample)\n",
-            "| # | Question | Expected | Correct | Latency ms |",
-            "|---|----------|----------|---------|------------|",
+            "| # | Question | Expected | Correct | TTFT ms | Total ms |",
+            "|---|----------|----------|---------|---------|----------|",
         ]
         for r in llm_rows:
             tick = "✓" if r["correct"] else "✗"
             lines.append(
-                f"| {r['qi']} | {r['question'][:60]} | {r['expected'][:30]} "
-                f"| {tick} | {r['lat_ms']:.0f} |"
+                f"| {r['qi']} | {r['question'][:55]} | {r['expected'][:25]} "
+                f"| {tick} | {r.get('ttft_ms',0):.0f} | {r['lat_ms']:.0f} |"
             )
         lines += [
             "",
             f"**LLM accuracy: {correct_n}/{len(llm_rows)} = {llm_acc:.1%}**  "
-            f"(avg latency {avg_lat:.0f} ms)",
+            f"avg TTFT {avg_ttft:.0f} ms · avg total {avg_lat:.0f} ms",
             "",
             "---",
             "",
@@ -494,16 +664,24 @@ def write_report(
             f"| {_avg(lst,'kv_mse'):.3e} |"
         )
     lines.append("| FP16 baseline | — | — | — | 1.00× | — | 0 |")
-    lines += [
-        "",
-        "---",
-        "",
-        "## Summary\n",
-        f"- BM25 retrieval recall   : **{recall:.1%}** ({retrieval_hits}/{total})",
-    ]
+    lines += ["", "---", "", "## Summary\n"]
+    lines.append(f"- BM25 recall            : **{bm25_recall:.1%}** ({bm25_hits}/{total})")
+    if hybrid_recall is not None:
+        lines.append(
+            f"- Hybrid recall @{fetch_k}     : **{hybrid_recall:.1%}** ({hybrid_hits}/{total})"
+            f"  (+{hybrid_recall-bm25_recall:.1%})"
+        )
+    if reranked_recall is not None:
+        lines.append(
+            f"- Reranked recall @{top_k}    : **{reranked_recall:.1%}** ({reranked_hits}/{total})"
+            f"  (+{reranked_recall-bm25_recall:.1%} vs BM25)"
+        )
     if llm_acc is not None:
         lines.append(
             f"- LLM answer accuracy    : **{llm_acc:.1%}** ({correct_n}/{len(llm_rows)} sample)"
+        )
+        lines.append(
+            f"- LLM avg TTFT           : **{avg_ttft:.0f} ms**  (total {avg_lat:.0f} ms)"
         )
     for scheme, lst in [("turbo_prod", prod_lst), ("turbo_mse", mse_lst)]:
         c = _avg(lst, "compression")
@@ -515,9 +693,11 @@ def write_report(
 
     json_path = out_dir / f"{stem}.json"
     json_path.write_text(json.dumps({
-        "retrieval_recall": recall,
-        "llm_accuracy":     llm_acc,
-        "llm_rows":         llm_rows,
+        "bm25_recall":     bm25_recall,
+        "hybrid_recall":   hybrid_recall,
+        "reranked_recall": reranked_recall,
+        "llm_accuracy":    llm_acc,
+        "llm_rows":       llm_rows,
         "kv_summary": {
             s: {"avg_compression": _avg(l,"compression"),
                 "avg_pack_us":     _avg(l,"pack_us"),
@@ -550,8 +730,43 @@ def run(cfg: dict, llm_sample_override: int | None) -> None:
 
     # ── BM25 ────────────────────────────────────────────────────── #
     print("Building BM25 index …")
-    bm25  = BM25(corpus)
-    top_k = _cfg(cfg, "retrieval", "top_k", default=5)
+    bm25_index   = BM25(corpus)
+    top_k        = _cfg(cfg, "retrieval", "top_k",        default=5)
+    fetch_k      = _cfg(cfg, "retrieval", "fetch_k",      default=20)
+    ret_mode     = _cfg(cfg, "retrieval", "mode",         default="hybrid")
+    dense_model  = _cfg(cfg, "retrieval", "dense_model",  default="sentence-transformers/all-MiniLM-L6-v2")
+    rrf_k        = _cfg(cfg, "retrieval", "rrf_k",        default=60)
+    reranker_mdl = _cfg(cfg, "retrieval", "reranker",     default="cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+    # ── Dense + Hybrid ──────────────────────────────────────────── #
+    retriever: BM25 | HybridRetriever = bm25_index
+    use_hybrid = (ret_mode == "hybrid")
+    if use_hybrid:
+        if not _ST_OK:
+            print("Dense     : sentence-transformers not installed → falling back to BM25")
+            use_hybrid = False
+        else:
+            try:
+                dense     = DenseRetriever(corpus, model_name=dense_model)
+                retriever = HybridRetriever(bm25_index, dense, rrf_k=rrf_k)
+                print(f"Retriever : Hybrid (BM25 + Dense, RRF k={rrf_k}), fetch_k={fetch_k}")
+            except Exception as exc:
+                print(f"Dense     : failed ({exc}) → falling back to BM25")
+                use_hybrid = False
+
+    if not use_hybrid:
+        print("Retriever : BM25 only")
+
+    # ── Cross-encoder re-ranker ─────────────────────────────────── #
+    reranker: CrossEncoderReranker | None = None
+    if use_hybrid and reranker_mdl:
+        if not _ST_OK:
+            print("Reranker  : sentence-transformers not installed → skipped")
+        else:
+            try:
+                reranker = CrossEncoderReranker(model_name=reranker_mdl)
+            except Exception as exc:
+                print(f"Reranker  : failed ({exc}) → skipped")
 
     # ── GPU + TurboQuant ────────────────────────────────────────── #
     if not torch.cuda.is_available():
@@ -570,40 +785,63 @@ def run(cfg: dict, llm_sample_override: int | None) -> None:
 
     # ── Main loop ───────────────────────────────────────────────── #
     print(f"Running retrieval + KV simulation on {len(qa_pairs)} questions …")
-    retrieval_hits = 0
+    bm25_hit_count    = 0
+    hybrid_hit_count  = 0 if use_hybrid else None
+    reranked_hit_count= 0 if reranker   else None
     kv_all:   list[KVResult] = []
     llm_rows: list[dict]     = []
 
     for qi, qa in enumerate(qa_pairs):
-        hits     = bm25.retrieve(qa["question"], k=top_k)
-        recalled = qa["answer"].lower() in " ".join(d.lower() for _, _, d in hits)
-        if recalled:
-            retrieval_hits += 1
+        ans_low = qa["answer"].lower()
 
-        context  = "\n\n".join(doc for _, _, doc in hits)
-        n_tokens = max(64, int(len(context) / CHARS_PER_TOK))
+        # BM25@top_k baseline (always tracked)
+        bm25_hits_q = bm25_index.retrieve(qa["question"], k=top_k)
+        if ans_low in " ".join(d.lower() for _, _, d in bm25_hits_q):
+            bm25_hit_count += 1
+
+        # Hybrid@fetch_k → optional Reranked@top_k
+        if use_hybrid:
+            hybrid_hits_q = retriever.retrieve(qa["question"], k=fetch_k)
+            if ans_low in " ".join(d.lower() for _, _, d in hybrid_hits_q):
+                hybrid_hit_count += 1
+
+            if reranker:
+                reranked_q = reranker.rerank(qa["question"], hybrid_hits_q, k=top_k)
+                if ans_low in " ".join(d.lower() for _, _, d in reranked_q):
+                    reranked_hit_count += 1
+                hits_for_context = reranked_q
+            else:
+                hits_for_context = hybrid_hits_q[:top_k]
+        else:
+            hits_for_context = bm25_hits_q
+
+        context  = "\n\n".join(doc for _, _, doc in hits_for_context)
+        n_tokens = min(max(64, int(len(context) / CHARS_PER_TOK)), 4096)
         kv_all.extend(simulate_kv(tq, n_tokens))
 
         if ollama_ok and qi < llm_sample:
-            answer, lat_ms = ollama_generate(
+            answer, lat_ms, ttft_ms = ollama_generate(
                 build_prompt(system, qa["question"], context),
                 ollama_url, model, timeout,
             )
-            correct = qa["answer"].lower() in answer.lower()
+            correct = ans_low in answer.lower()
             llm_rows.append({
                 "qi": qi + 1, "question": qa["question"],
                 "expected": qa["answer"],
                 "answer": answer[:200].replace("\n", " "),
-                "correct": correct, "lat_ms": lat_ms,
+                "correct": correct, "lat_ms": lat_ms, "ttft_ms": ttft_ms,
             })
             if (qi + 1) % 10 == 0:
                 print(f"  LLM {qi+1}/{llm_sample} done …")
 
         if (qi + 1) % 500 == 0:
-            pct = retrieval_hits / (qi + 1) * 100
-            print(f"  [{qi+1:>5}/{len(qa_pairs)}] retrieval recall so far: {pct:.1f}%")
+            pct  = bm25_hit_count / (qi + 1) * 100
+            hyb  = f"  hybrid@{fetch_k}={hybrid_hit_count/(qi+1)*100:.1f}%" if use_hybrid else ""
+            rnk  = f"  rerank@{top_k}={reranked_hit_count/(qi+1)*100:.1f}%" if reranker   else ""
+            print(f"  [{qi+1:>5}/{len(qa_pairs)}] BM25@{top_k}={pct:.1f}%{hyb}{rnk}")
 
-    write_report(cfg, qa_pairs, retrieval_hits, llm_rows, kv_all)
+    write_report(cfg, qa_pairs, bm25_hit_count, hybrid_hit_count,
+                 reranked_hit_count, llm_rows, kv_all)
 
 
 def main() -> None:

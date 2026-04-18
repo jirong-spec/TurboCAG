@@ -45,7 +45,12 @@ qa:
     rating:   "What is the customer rating of '{name}'?"
 
 retrieval:
-  top_k: 5   # chunks retrieved per question
+  top_k: 100                # final chunks sent to LLM
+  fetch_k: 200             # candidates fetched before re-ranking (hybrid only)
+  mode: hybrid            # "bm25" | "hybrid" (BM25 + Dense, fused with RRF)
+  dense_model: "sentence-transformers/all-MiniLM-L6-v2"  # ~90 MB download
+  rrf_k: 60               # RRF constant (higher → smoother blend)
+  reranker: "cross-encoder/ms-marco-MiniLM-L-6-v2"       # set to "" to disable
 
 llm:
   provider:    "ollama"                  # currently only "ollama" is supported
