@@ -240,15 +240,44 @@ Set `qa.auto_generate: false` and point `qa.path` at a JSONL file where each lin
 | `output/rag_results.json` | Same data in JSON for downstream processing |
 | `data/qa_pairs.jsonl` | Auto-generated Q&A pairs (cached on first run) |
 
-### Results (RTX 3060, GYG dataset, qwen2.5:7b)
+### Results (RTX 3060, GYG dataset 200k docs, qwen2.5:7b)
 
 | Metric | Value |
 |---|---|
-| BM25 retrieval recall (5 000 Q) | **48.1%** |
+| BM25 retrieval recall (5 000 Q) | **48.3%** |
 | LLM answer accuracy (50-Q sample) | **22–26%** |
-| turbo_prod VRAM compression | **3.81×** |
+| turbo_prod VRAM compression | **3.80×** |
 | turbo_mse VRAM compression | **3.86×** |
 | turbo_mse pack latency vs turbo_prod | **~40% faster** |
+
+### GPU-BM25 — corpus size vs VRAM
+
+The BM25 index is stored as a **sparse CSR tensor in VRAM** (no CPU RAM bottleneck).  
+Empirical baseline: 200 000 docs → **347 MB VRAM** (~1.7 KB / doc, GYG English descriptions).
+
+#### Corpus capacity by available VRAM
+
+| VRAM for BM25 | Max docs | Typical use case |
+|---|---|---|
+| 0.5 GB | ~300 K | Knowledge base / FAQ |
+| 1 GB | ~600 K | Product catalogue |
+| 2 GB | ~1.2 M | News archive |
+| 4 GB | ~2.4 M | Large enterprise corpus |
+| 6 GB | ~3.5 M | Multi-domain retrieval |
+
+> VRAM for BM25 = total VRAM − model weights − KV cache headroom.
+
+#### Free VRAM after loading Ollama model
+
+| GPU (total VRAM) | Ollama 7B (4-bit) | Ollama 13B (4-bit) | Free for BM25 |
+|---|---|---|---|
+| RTX 3060 12 GB | ~5 GB | — (OOM) | **~6 GB → 3.5 M docs** |
+| RTX 4090 24 GB | ~5 GB | ~8 GB | **~14 GB → 8 M docs** |
+| A100 40 GB | ~5 GB | ~8 GB | **~30 GB → 17 M docs** |
+| A100 80 GB | ~5 GB | ~8 GB | **~70 GB → 40 M docs** |
+
+> **Rule of thumb:** each additional GB of VRAM holds roughly **600 000 more documents**.  
+> Longer / denser documents (e.g. legal, academic) use more unique tokens per doc and will reduce capacity; short documents (titles, tweets) will increase it.
 
 ---
 
