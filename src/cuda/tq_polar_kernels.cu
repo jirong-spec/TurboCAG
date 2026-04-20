@@ -1,5 +1,6 @@
 #include "tq_polar.cuh"
 #include "tq_shared_device.cuh"
+#include "tq_cuda_check.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -20,69 +21,26 @@ __device__ __forceinline__ float sign_flip(int idx) {
 }
 
 // ---------------------------------------------------------------------------
-// Codebooks
+// Codebook — 4-bit, 16-level Gaussian Lloyd-Max optimal for N(0,1)
+// Shared by both K and V in the WHT-rotated domain.
 // ---------------------------------------------------------------------------
 
-// K 2-bit: 4-level Lloyd-Max optimal for N(0,1)
-__device__ __constant__ float kK2Codebook[4] = {
-    -1.5104f, -0.4528f, 0.4528f, 1.5104f
+__device__ __constant__ float kPolarCodebook[16] = {
+    -2.7326f, -2.0690f, -1.6180f, -1.2562f,
+    -0.9423f, -0.6568f, -0.3880f, -0.1284f,
+     0.1284f,  0.3880f,  0.6568f,  0.9423f,
+     1.2562f,  1.6180f,  2.0690f,  2.7326f
 };
 
-// V 3-bit: 8-level Lloyd-Max optimal for N(0,1) — same as turbo_prod K3
-__device__ __constant__ float kV3Codebook[8] = {
-    -2.1513f, -1.34326f, -0.755526f, -0.244919f,
-     0.244919f, 0.755526f,  1.34326f,  2.1513f
-};
-
-// Nearest K2 centroid via threshold comparison (faster than brute-force for 4 levels).
-// Optimal threshold for Lloyd-Max N(0,1) 4-level: ±0.9816.
-__device__ __forceinline__ int nearest_k2_idx(float x) {
-    if (x < -0.9816f) return 0;
-    if (x <  0.0f)    return 1;
-    if (x <  0.9816f) return 2;
-    return 3;
-}
-
-// Nearest V3 centroid via brute-force (8 levels).
-__device__ __forceinline__ int nearest_v3_idx(float x) {
+__device__ __forceinline__ int nearest_polar4_idx(float x) {
     int best = 0;
-    float best_dist = fabsf(x - kV3Codebook[0]);
+    float best_dist = fabsf(x - kPolarCodebook[0]);
     #pragma unroll
-    for (int i = 1; i < 8; ++i) {
-        float d = fabsf(x - kV3Codebook[i]);
+    for (int i = 1; i < 16; ++i) {
+        float d = fabsf(x - kPolarCodebook[i]);
         if (d < best_dist) { best_dist = d; best = i; }
     }
     return best;
-}
-
-// ---------------------------------------------------------------------------
-// 3-bit pack / unpack (bit-stream format: 3 consecutive bits per code).
-// Replicated here per CUDA anonymous-namespace requirement.
-// ---------------------------------------------------------------------------
-__device__ __forceinline__ uint8_t unpack_3bit_get(const uint8_t* src, int idx) {
-    int bit  = idx * 3;
-    int byte = bit >> 3;
-    int off  = bit & 7;
-    unsigned int x = src[byte];
-    if (off > 5) x |= ((unsigned int)src[byte + 1] << 8);
-    return (uint8_t)((x >> off) & 0x7u);
-}
-
-__device__ __forceinline__ uint8_t pack_3bit_byte_from_codes(
-    const int* codes, int byte_idx, int D)
-{
-    uint8_t out = 0;
-    int bit_base = byte_idx * 8;
-    #pragma unroll
-    for (int k = 0; k < 8; ++k) {
-        int global_bit = bit_base + k;
-        int code_idx   = global_bit / 3;
-        if (code_idx < D) {
-            int bit_in_code = global_bit % 3;
-            out |= (uint8_t)(((codes[code_idx] >> bit_in_code) & 1) << k);
-        }
-    }
-    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -140,17 +98,17 @@ __global__ void polar_pack_kv_kernel(
 
     uint8_t* page_base = page_pool + (size_t)physical_block * layout.page_size_bytes;
 
-    uint8_t* k2_codes = page_base + layout.k2_codes_offset +
+    uint8_t* k4_codes = page_base + layout.k4_codes_offset +
         polar_token_head_offset(token_in_block, head_idx, cfg.num_kv_heads,
-                                layout.k2_bytes_per_token_head);
+                                layout.k4_bytes_per_token_head);
     half* kscale = reinterpret_cast<half*>(
         page_base + layout.k_scales_offset +
         polar_token_head_offset(token_in_block, head_idx, cfg.num_kv_heads,
                                 layout.scale_bytes_per_token_head));
 
-    uint8_t* v3_codes = page_base + layout.v3_codes_offset +
+    uint8_t* v4_codes = page_base + layout.v4_codes_offset +
         polar_token_head_offset(token_in_block, head_idx, cfg.num_kv_heads,
-                                layout.v3_bytes_per_token_head);
+                                layout.v4_bytes_per_token_head);
     half* vscale = reinterpret_cast<half*>(
         page_base + layout.v_scales_offset +
         polar_token_head_offset(token_in_block, head_idx, cfg.num_kv_heads,
@@ -161,8 +119,8 @@ __global__ void polar_pack_kv_kernel(
     float* sv  = smem + MAX_D;   // [MAX_D] rotated V
     float* red = smem + 2*MAX_D; // [MAX_D] reduction scratch
 
-    __shared__ int kidx_s[MAX_D]; // 2-bit K indices
-    __shared__ int vidx_s[MAX_D]; // 3-bit V indices
+    __shared__ int kidx_s[MAX_D]; // 4-bit K indices
+    __shared__ int vidx_s[MAX_D]; // 4-bit V indices
 
     const int base = (token_idx * cfg.num_kv_heads + head_idx) * D;
     const float inv_sqrt_d = rsqrtf((float)D);
@@ -202,18 +160,18 @@ __global__ void polar_pack_kv_kernel(
     if (tid == 0) *vscale = f2h(vrms);
     __syncthreads();
 
-    // ---- Step 4: quantise -------------------------------------------------
-    kidx_s[tid] = nearest_k2_idx(sk[tid] / krms);
-    vidx_s[tid] = nearest_v3_idx(sv[tid] / vrms);
+    // ---- Step 4: quantise (4-bit, 16-level Gaussian codebook) ------------
+    kidx_s[tid] = nearest_polar4_idx(sk[tid] / krms);
+    vidx_s[tid] = nearest_polar4_idx(sv[tid] / vrms);
     __syncthreads();
 
-    // ---- Step 5: pack K (2-bit, 4 codes/byte) ----------------------------
-    if (tid < layout.k2_bytes_per_token_head)
-        k2_codes[tid] = pack_2bit_byte_from_codes(kidx_s, tid, D);
+    // ---- Step 5: pack K (4-bit nibbles, 2 codes/byte) --------------------
+    if (tid < D / 2)
+        k4_codes[tid] = (uint8_t)((kidx_s[2*tid+1] << 4) | (kidx_s[2*tid] & 0xF));
 
-    // ---- Step 6: pack V (3-bit bit-stream) --------------------------------
-    for (int byte_i = tid; byte_i < layout.v3_bytes_per_token_head; byte_i += D)
-        v3_codes[byte_i] = pack_3bit_byte_from_codes(vidx_s, byte_i, D);
+    // ---- Step 6: pack V (4-bit nibbles, 2 codes/byte) --------------------
+    if (tid < D / 2)
+        v4_codes[tid] = (uint8_t)((vidx_s[2*tid+1] << 4) | (vidx_s[2*tid] & 0xF));
 }
 
 // ---------------------------------------------------------------------------
@@ -248,17 +206,17 @@ __global__ void polar_dequant_kv_kernel(
 
     const uint8_t* page_base = page_pool + (size_t)physical_block * layout.page_size_bytes;
 
-    const uint8_t* k2_codes = page_base + layout.k2_codes_offset +
+    const uint8_t* k4_codes = page_base + layout.k4_codes_offset +
         polar_token_head_offset(token_in_block, head_idx, cfg.num_kv_heads,
-                                layout.k2_bytes_per_token_head);
+                                layout.k4_bytes_per_token_head);
     const half* k_scale_ptr = reinterpret_cast<const half*>(
         page_base + layout.k_scales_offset +
         polar_token_head_offset(token_in_block, head_idx, cfg.num_kv_heads,
                                 layout.scale_bytes_per_token_head));
 
-    const uint8_t* v3_codes = page_base + layout.v3_codes_offset +
+    const uint8_t* v4_codes = page_base + layout.v4_codes_offset +
         polar_token_head_offset(token_in_block, head_idx, cfg.num_kv_heads,
-                                layout.v3_bytes_per_token_head);
+                                layout.v4_bytes_per_token_head);
     const half* v_scale_ptr = reinterpret_cast<const half*>(
         page_base + layout.v_scales_offset +
         polar_token_head_offset(token_in_block, head_idx, cfg.num_kv_heads,
@@ -269,9 +227,9 @@ __global__ void polar_dequant_kv_kernel(
     const int base        = (token_idx * cfg.num_kv_heads + head_idx) * D;
     const float inv_sqrt_d = rsqrtf((float)D);
 
-    // ---- Decode K: 2-bit → WHT⁻¹ → sign-unflip → FP16 -------------------
+    // ---- Decode K: 4-bit → WHT⁻¹ → sign-unflip → FP16 -------------------
     float krms = h2f(*k_scale_ptr);
-    smem[tid]  = kK2Codebook[unpack_2bit_get(k2_codes, tid)] * krms;
+    smem[tid]  = kPolarCodebook[unpack_4bit_get(k4_codes, tid)] * krms;
     __syncthreads();
 
     hadamard_inplace<MAX_D>(smem, D);
@@ -279,9 +237,9 @@ __global__ void polar_dequant_kv_kernel(
     out_key[base + tid] = f2h(smem[tid] * inv_sqrt_d * sign_flip(tid));
     __syncthreads();
 
-    // ---- Decode V: 3-bit → WHT⁻¹ → sign-unflip → FP16 -------------------
+    // ---- Decode V: 4-bit → WHT⁻¹ → sign-unflip → FP16 -------------------
     float vrms = h2f(*v_scale_ptr);
-    smem[tid]  = kV3Codebook[unpack_3bit_get(v3_codes, tid)] * vrms;
+    smem[tid]  = kPolarCodebook[unpack_4bit_get(v4_codes, tid)] * vrms;
     __syncthreads();
 
     hadamard_inplace<MAX_D>(smem, D);
@@ -295,7 +253,7 @@ __global__ void polar_dequant_kv_kernel(
 // grid = (num_queries, num_kv_heads),  threads = head_dim
 // Shared memory (extern): qrot[MAX_D] | vaccum[MAX_D] | red[MAX_D]
 //
-// K decoded as 2-bit, V decoded as 3-bit (both in Hadamard-rotated domain).
+// K decoded as 4-bit, V decoded as 4-bit (both in Hadamard-rotated domain).
 // Logit convention: <q, k>  (no 1/sqrt(D)), matching V6 / QJL convention.
 // ---------------------------------------------------------------------------
 template<int MAX_D>
@@ -349,16 +307,16 @@ __global__ void polar_fused_attn_online_kernel(
         const uint8_t* page_base = page_pool +
             (size_t)physical_block * layout.page_size_bytes;
 
-        // ---- 2-bit K decode → dot product ----------------------------------
-        const uint8_t* k2_codes = page_base + layout.k2_codes_offset +
+        // ---- 4-bit K decode → dot product ----------------------------------
+        const uint8_t* k4_codes = page_base + layout.k4_codes_offset +
             polar_token_head_offset(token_in_block, head_idx, cfg.num_kv_heads,
-                                    layout.k2_bytes_per_token_head);
+                                    layout.k4_bytes_per_token_head);
         const half* k_scale_ptr = reinterpret_cast<const half*>(
             page_base + layout.k_scales_offset +
             polar_token_head_offset(token_in_block, head_idx, cfg.num_kv_heads,
                                     layout.scale_bytes_per_token_head));
 
-        float kval = kK2Codebook[unpack_2bit_get(k2_codes, tid)] * h2f(*k_scale_ptr);
+        float kval = kPolarCodebook[unpack_4bit_get(k4_codes, tid)] * h2f(*k_scale_ptr);
 
         red[tid] = qrot[tid] * kval;
         __syncthreads();
@@ -381,16 +339,16 @@ __global__ void polar_fused_attn_online_kernel(
 
         vaccum[tid] *= sh_a;
 
-        // ---- 3-bit V decode → accumulate -----------------------------------
-        const uint8_t* v3_codes = page_base + layout.v3_codes_offset +
+        // ---- 4-bit V decode → accumulate -----------------------------------
+        const uint8_t* v4_codes = page_base + layout.v4_codes_offset +
             polar_token_head_offset(token_in_block, head_idx, cfg.num_kv_heads,
-                                    layout.v3_bytes_per_token_head);
+                                    layout.v4_bytes_per_token_head);
         const half* v_scale_ptr = reinterpret_cast<const half*>(
             page_base + layout.v_scales_offset +
             polar_token_head_offset(token_in_block, head_idx, cfg.num_kv_heads,
                                     layout.scale_bytes_per_token_head));
 
-        float vval = kV3Codebook[unpack_3bit_get(v3_codes, tid)] * h2f(*v_scale_ptr);
+        float vval = kPolarCodebook[unpack_4bit_get(v4_codes, tid)] * h2f(*v_scale_ptr);
 
         vaccum[tid] += sh_b * vval;
         __syncthreads();
@@ -433,6 +391,8 @@ void launch_tq_polar_pack_kv(
     size_t shmem = sizeof(float) * 3 * 128;
     polar_pack_kv_kernel<128><<<grid, threads, shmem, stream>>>(
         key, value, slot_mapping, page_pool, layout, cfg, num_tokens);
+    TQ_CHECK_LAUNCH("polar_pack_kv_kernel");
+    TQ_CHECK_ASYNC(stream);
 }
 
 void launch_tq_polar_dequant_kv(
@@ -452,6 +412,8 @@ void launch_tq_polar_dequant_kv(
     size_t shmem = sizeof(float) * 128;
     polar_dequant_kv_kernel<128><<<grid, threads, shmem, stream>>>(
         page_pool, slot_mapping, out_key, out_value, layout, cfg, num_tokens);
+    TQ_CHECK_LAUNCH("polar_dequant_kv_kernel");
+    TQ_CHECK_ASYNC(stream);
 }
 
 void launch_tq_polar_fused_attention_output(
@@ -474,4 +436,6 @@ void launch_tq_polar_fused_attention_output(
     polar_fused_attn_online_kernel<128><<<grid, threads, shmem, stream>>>(
         query, page_pool, slot_mapping, output,
         layout, cfg, num_queries, num_kv_tokens);
+    TQ_CHECK_LAUNCH("polar_fused_attn_online_kernel");
+    TQ_CHECK_ASYNC(stream);
 }
