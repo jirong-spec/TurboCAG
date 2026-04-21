@@ -17,7 +17,7 @@ from tq_backend.model_runner import TQModelRunner
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model",   default="Qwen/Qwen2.5-0.5B-Instruct")
+    ap.add_argument("--model",   default="Qwen/Qwen2.5-3B-Instruct")
     ap.add_argument("--store",   default="./kv_store")
     ap.add_argument("--corpus",  default=None, help="JSONL file: {id, text} per line")
     ap.add_argument("--text",    default=None, help="Single document text")

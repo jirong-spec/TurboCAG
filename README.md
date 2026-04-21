@@ -1,7 +1,7 @@
 # TurboCAG — Cache-Augmented Generation with Compressed KV
 
 TurboCAG is a research system for **zero-prefill RAG inference** on NVIDIA GPUs.  
-Documents are encoded offline, KV caches are compressed with 4-bit CUDA kernels, and stored to disk. At query time, the model loads the pre-compressed KV and skips prefill entirely — delivering **5–7× TTFT speedup** on LongBench/qasper and **3.5–3.8× VRAM reduction** with near-zero F1 loss on Qwen2.5-3B.
+Documents are encoded offline, KV caches are compressed with 4-bit CUDA kernels, and stored to disk. At query time, the model loads the pre-compressed KV and skips prefill entirely — delivering **1.6–1.7× TTFT speedup** vs normal RAG on LongBench/qasper (200 samples, 8K ctx) and **3.5–3.8× VRAM reduction** on Qwen2.5-3B.
 
 ---
 
@@ -14,9 +14,9 @@ Document text
     │
     ▼  forward-pass Qwen2.5 → extract KV per layer
     │
-    ▼  compress with TurboQuant / PolarQuant CUDA kernels
-    │   turbo_prod : K=3-bit + 1-bit residual, V=4-bit   → 3.8× compression
-    │   turbo_mse  : INT4 MSE-optimal                    → 3.5× compression
+    ▼  compress with TurboQuant CUDA kernels
+    │   turbo_prod : K=4-bit interleaved (3-bit Lloyd-Max | 1-bit QJL sign), V=4-bit   → 3.8× compression
+    │   turbo_mse  : INT4 MSE-optimal                                                  → 3.5× compression
     │
     ▼  save compressed page_pool to disk  (.bin + .meta per layer)
 
@@ -59,16 +59,17 @@ Key takeaways at 32K context:
 - **VRAM gap: 3.8×** — turbo_prod saves ~850 MB per inference vs fp16 KV
 - 1 doc skipped (OOM during 32K forward-pass precompute); 99/100 succeeded
 
-### LongBench / qasper — short context (20 samples, avg 5 926 context tokens)
+### LongBench / qasper — 200 samples, ctx=8 192 tokens
 
 Dataset: `qasper` test split — single-doc QA on scientific papers.  
-TTFT = disk\_load(36 layers) + query\_prefill. F1 = token-level F1 vs ground truth.
+TTFT = disk\_load(36 layers) + query\_prefill. F1 = token-level F1 vs ground truth.  
+Normal RAG (full doc+query prefill, 3-sample avg): **2 447 ms**.
 
-| Scheme     | Normal RAG  | CAG TTFT  | Speedup  | KV VRAM   | VRAM×    | F1    |
-|------------|-------------|-----------|----------|-----------|----------|-------|
-| fp16 CAG   | 1 049 ms    | 194.9 ms  | **5.4×** | 208 MB    | 1.0×     | 0.199 |
-| turbo\_prod | 1 049 ms    | 161.4 ms  | **6.5×** | 54.6 MB   | **3.8×** | 0.208 |
-| turbo\_mse  | 1 049 ms    | 162.2 ms  | **6.5×** | 58.7 MB   | **3.6×** | 0.231 |
+| Scheme      | CAG TTFT avg | p50      | p95      | Speedup  | KV VRAM  | VRAM×    | F1    |
+|-------------|-------------|----------|----------|----------|----------|----------|-------|
+| fp16        | 1 523.8 ms  | 1 505.6  | 1 534.7  | **1.6×** | 288 MB   | 1.0×     | 0.135 |
+| turbo\_prod  | 1 402.6 ms  | 1 395.5  | 1 435.3  | **1.7×** | 75 MB    | **3.8×** | 0.125 |
+| turbo\_mse   | 1 405.7 ms  | 1 396.9  | 1 451.9  | **1.7×** | 81 MB    | **3.6×** | 0.096 |
 
 ### TTFT Scaling — Sim Mode (Qwen2.5-3B scale, 1 143 tokens, 36 layers)
 
@@ -107,6 +108,8 @@ TurboCAG/
 │   ├── model_runner.py       # Qwen2.5 loader + KV extraction
 │   ├── benchmark.py          # End-to-end TTFT + accuracy comparison
 │   └── ttft_sim.py           # GPU-only TTFT simulation (no model needed)
+├── tests/
+│   └── test_turbo_prod_nibble.cu  # Roundtrip + nibble bit-order + layout correctness (14 assertions)
 ├── scripts/
 │   ├── build_data.py         # Scan docs (txt/md/jsonl/csv/pdf) → corpus.jsonl + optional KV precompute
 │   ├── precompute_cag.py     # Offline: compress corpus to disk (low-level)
@@ -287,7 +290,7 @@ output = cag.fused_attention(query, pool, slots, N, "turbo_prod", (2, 128))
 
 | Scheme      | K bits | V bits | Method                   | Compression | AttnMSE   |
 |-------------|--------|--------|--------------------------|-------------|-----------|
-| turbo\_prod  | 3+1    | 4      | Lloyd-Max + QJL residual | **3.8×**    | 0.00028   |
+| turbo\_prod  | 4 (interleaved) | 4 | Lloyd-Max + QJL residual sign (nibble: bits[2:0]=code, bit[3]=sign) | **3.8×** | 0.00028 |
 | turbo\_mse   | 4      | 4      | INT4 MSE-optimal         | **3.5×**    | 0.00078   |
 
 All kernels use **online softmax** (FlashAttention-style) — no FP16 KV tensor is ever written to global memory during decode.
@@ -298,8 +301,10 @@ All kernels use **online softmax** (FlashAttention-style) — no FP16 KV tensor 
 
 **CAG vs RAG.**  Standard RAG prefills the full document context on every query (O(L·N) GPU compute). TurboCAG pre-computes KV offline and loads from disk, reducing per-query GPU work to O(L·disk\_IO + query\_tokens).
 
-**Accuracy trade-off.** turbo\_prod achieves 67% exact-match accuracy (vs 75% for fp16 CAG) at 3.8× VRAM savings and near-lossless attention fidelity (AttnMSE = 0.00028). Errors arise from quantization noise accumulating across 36 transformer layers.
+**Accuracy trade-off.** turbo\_prod achieves F1=0.125 vs fp16 F1=0.135 on qasper (200 samples, 8K ctx) at 3.8× VRAM savings (AttnMSE=0.00028). The K nibble format packs the 3-bit Lloyd-Max code and 1-bit QJL residual sign into a single 4-bit value per element, preserving fidelity while simplifying the page layout.
 
 **Paged allocation.** `TQAllocator` manages a GPU page pool with `block_size=16` token slots. Slot mappings from vLLM/HF pass directly to TQ kernels — no translation needed.
 
 **GPU startup.** Build `libturboquant.so` with `cmake --build build` before running any Python code.
+
+**KV store versioning.** The binary page format is not versioned. After any K/V layout change, delete all affected `.bin` files and re-run `precompute_cag.py` — loading stale pages with a new kernel silently produces garbage output.

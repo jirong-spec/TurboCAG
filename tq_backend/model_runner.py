@@ -1,8 +1,8 @@
-"""model_runner.py — TQModelRunner: Qwen2.5-0.5B + TurboQuant attention.
+"""model_runner.py — TQModelRunner: Qwen2.5-3B + TurboQuant attention.
 
 Usage
 ─────
-runner = TQModelRunner("Qwen/Qwen2.5-0.5B-Instruct", store_dir="./kv_store")
+runner = TQModelRunner("Qwen/Qwen2.5-3B-Instruct", store_dir="./kv_store")
 
 # Offline: encode documents (once, then cached on disk)
 runner.precompute_corpus({"doc1": "text of doc 1", "doc2": "text of doc 2"})
@@ -45,7 +45,7 @@ class RunResult:
 class TQModelRunner:
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
+        model_name: str = "Qwen/Qwen2.5-3B-Instruct",
         store_dir: str | Path = "./kv_store",
         lib_path: str | Path | None = None,
         device: str = "cuda",
@@ -66,7 +66,7 @@ class TQModelRunner:
         )
         self.model.eval()
 
-        # Qwen2.5-0.5B: 24 layers, num_kv_heads=2, head_dim=64
+        # Qwen2.5-3B: 24 layers, num_kv_heads=2, head_dim=64
         cfg = self.model.config
         self.num_layers   = cfg.num_hidden_layers
         self.num_kv_heads = cfg.num_key_value_heads

@@ -17,9 +17,9 @@ import torch
 from .turboquant_wrapper import TurboQuantWrapper, TQConfig
 
 
-# ── Qwen2.5-0.5B scale defaults ────────────────────────────────────── #
-QWEN_05B = dict(
-    d_model=896,
+# ── Qwen2.5-3B scale defaults ────────────────────────────────────── #
+QWEN_3B = dict(
+    d_model=1536,
     num_layers=24,
     num_kv_heads=2,
     head_dim=64,
@@ -211,7 +211,7 @@ def run_ttft_sim(
 
 def _print_ttft_table(results: dict) -> None:
     print("\n" + "=" * 60)
-    print("  TurboRAG TTFT Simulation  —  Qwen2.5-0.5B scale")
+    print("  TurboRAG TTFT Simulation  —  Qwen2.5-3B scale")
     print("=" * 60)
     print(f"  {'Scheme':<14} {'TTFT(ms)':>10} {'Speedup':>9} {'VRAM(MB)':>10} {'VRAM×':>7}")
     print("-" * 60)

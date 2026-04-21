@@ -4,7 +4,7 @@
 Modes
 ─────
   sim        GPU-only TTFT simulation, no model download needed (fast)
-  full       Real Qwen2.5-0.5B inference with accuracy measurement
+  full       Real Qwen2.5-3B inference with accuracy measurement
   longbench  LongBench dataset evaluation (TTFT / VRAM / F1)
              Requires: pip install datasets
 

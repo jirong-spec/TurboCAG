@@ -51,7 +51,7 @@ class SchemeStats:
 
 
 def run_benchmark(
-    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
+    model_name: str = "Qwen/Qwen2.5-3B-Instruct",
     store_dir: str = "./kv_store",
     corpus_path: str | None = None,
     queries_path: str | None = None,
@@ -376,7 +376,7 @@ def _print_report(stats: dict, avg_mse: dict, schemes: list, normal_ttft_ms: flo
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model",   default="Qwen/Qwen2.5-0.5B-Instruct")
+    ap.add_argument("--model",   default="Qwen/Qwen2.5-3B-Instruct")
     ap.add_argument("--store",   default="./kv_store")
     ap.add_argument("--corpus",  default=None)
     ap.add_argument("--queries", default=None)
